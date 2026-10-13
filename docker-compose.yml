@@ -1,190 +1,207 @@
-networks:
-  cdc-network:
-    driver: bridge
-
-volumes:
-  mongo_data:
-  postgres_data:
-  zookeeper_data:
-  kafka_data:
-
 services:
-  # =========================================================================
-  # 1. Apache Zookeeper (Coordinator for Kafka)
-  # =========================================================================
-  zookeeper:
-    image: debezium/zookeeper:2.5
-    container_name: zookeeper
-    restart: always
+  # ----------------------------------------------------------------------------
+  # 1. MongoDB Source (Isolated Replica Set rs0)
+  # ----------------------------------------------------------------------------
+  mongo-source:
+    image: mongo:8.0
+    container_name: isra-mongo-source
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
     ports:
-      - "2181:2181"
-    environment:
-      - ZOOKEEPER_CLIENT_PORT=2181
-      - ZOOKEEPER_TICK_TIME=2000
-    volumes:
-      - zookeeper_data:/zookeeper/data
-    networks:
-      - cdc-network
-
-  # =========================================================================
-  # 2. Apache Kafka (Message Broker for CDC events)
-  # =========================================================================
-  kafka:
-    image: debezium/kafka:2.5
-    container_name: kafka
-    restart: always
-    ports:
-      - "9092:9092"
-      - "29092:29092"
-    depends_on:
-      - zookeeper
-    environment:
-      - ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_BROKER_ID=1
-      - KAFKA_LISTENERS=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
-      - KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka:9092,EXTERNAL://localhost:29092
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      - KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL
-      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
-      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-    volumes:
-      - kafka_data:/kafka/data
-    networks:
-      - cdc-network
-
-  # =========================================================================
-  # 3. Source Database: MongoDB (with Replica Set rs0 for Oplog CDC)
-  # =========================================================================
-  mongodb:
-    image: mongo:6.0
-    container_name: mongodb
-    restart: always
-    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
-    ports:
-      - "27017:27017"
+      - "${MONGO_HOST_PORT:-27018}:27017"
     volumes:
       - mongo_data:/data/db
-      - ./mongo/init:/docker-entrypoint-initdb.d:ro
+      - ./mongodb/init-replica-set.js:/scripts/init-replica-set.js:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --port 27017 --eval 'rs.status().ok' || mongosh --port 27017 --eval 'db.adminCommand(\"ping\").ok'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     networks:
-      - cdc-network
+      - cdc-net
 
-  # Automated Replica Set Initializer for MongoDB
-  mongo-init:
-    image: mongo:6.0
-    container_name: mongo-init
-    restart: "no"
-    depends_on:
-      - mongodb
-    networks:
-      - cdc-network
-    command: >
-      bash -c "
-        echo 'Waiting for MongoDB to accept connections...'
-        until mongosh --host mongodb:27017 --eval 'db.adminCommand(\"ping\")' > /dev/null 2>&1; do
-          sleep 2
-        done
-        echo 'MongoDB is reachable. Initializing replica set rs0...'
-        mongosh --host mongodb:27017 --eval '
-          try {
-            rs.status();
-            console.log(\"Replica set rs0 already initialized.\");
-          } catch (e) {
-            rs.initiate({
-              _id: \"rs0\",
-              members: [{ _id: 0, host: \"mongodb:27017\" }]
-            });
-            console.log(\"Replica set rs0 initiated successfully.\");
-          }
-        '
-        echo 'Replica set check complete.'
-      "
-
-  # =========================================================================
-  # 4. Debezium Kafka Connect (Captures MongoDB Oplog events)
-  # =========================================================================
-  connect:
-    image: debezium/connect:2.5
-    container_name: connect
-    restart: always
+  # ----------------------------------------------------------------------------
+  # 2. Apache Kafka (KRaft mode - No ZooKeeper required)
+  # ----------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: isra-kafka
     ports:
-      - "8083:8083"
-    depends_on:
-      - kafka
-      - mongodb
+      - "${KAFKA_HOST_PORT:-9092}:9092"
     environment:
-      - BOOTSTRAP_SERVERS=kafka:9092
-      - GROUP_ID=1
-      - CONFIG_STORAGE_TOPIC=my_connect_configs
-      - OFFSET_STORAGE_TOPIC=my_connect_offsets
-      - STATUS_STORAGE_TOPIC=my_connect_statuses
-      - KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
-      - VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
-      - KEY_CONVERTER_SCHEMAS_ENABLE=false
-      - VALUE_CONVERTER_SCHEMAS_ENABLE=false
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:29092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
     networks:
-      - cdc-network
+      - cdc-net
 
-  # =========================================================================
-  # 5. Target Database: PostgreSQL
-  # =========================================================================
+  # ----------------------------------------------------------------------------
+  # 3. Kafka Connect with Debezium MongoDB Connector
+  # ----------------------------------------------------------------------------
+  kafka-connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: isra-kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongo-source:
+        condition: service_healthy
+    ports:
+      - "${CONNECT_HOST_PORT:-8083}:8083"
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:29092"
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: "_kafka_connect_configs"
+      OFFSET_STORAGE_TOPIC: "_kafka_connect_offsets"
+      STATUS_STORAGE_TOPIC: "_kafka_connect_status"
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      HEAP_OPTS: "-Xms256m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 25s
+    networks:
+      - cdc-net
+
+  # ----------------------------------------------------------------------------
+  # 4. Kafka UI for Topic and Message Monitoring
+  # ----------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: isra-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_HOST_PORT:-8080}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "local-cluster"
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:29092"
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: "debezium"
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: "http://kafka-connect:8083"
+    networks:
+      - cdc-net
+
+  # ----------------------------------------------------------------------------
+  # 5. PostgreSQL Target Database
+  # ----------------------------------------------------------------------------
   postgres:
-    image: postgres:15-alpine
-    container_name: postgres
-    restart: always
+    image: postgres:16-alpine
+    container_name: isra-postgres
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres_password
-      - POSTGRES_DB=inventory_sink
+      POSTGRES_DB: "${POSTGRES_DB:-isra_cdc}"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-isra_cdc}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
     networks:
-      - cdc-network
+      - cdc-net
 
-  # =========================================================================
-  # 6. CDC Consumer & Replication Receiver (Subscribes Kafka -> Updates Postgres)
-  # =========================================================================
+  # ----------------------------------------------------------------------------
+  # 6. pgAdmin 4 - PostgreSQL Web UI  ->  http://localhost:5050
+  #    Login: admin@isra.com  |  Password: admin
+  #    Server pre-configured: isra-postgres -> isra_cdc
+  # ----------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: isra-pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PGADMIN_HOST_PORT:-5050}:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "${PGADMIN_EMAIL:-admin@isra.com}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_PASSWORD:-admin}"
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./postgres/pgadmin-servers.json:/pgadmin4/servers.json:ro
+    networks:
+      - cdc-net
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # 7. Python CDC Consumer Application
+  # ----------------------------------------------------------------------------
   cdc-consumer:
     build:
       context: ./consumer
       dockerfile: Dockerfile
-    container_name: cdc-consumer
-    restart: always
+    container_name: isra-cdc-consumer
     depends_on:
-      - kafka
-      - postgres
-      - connect
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka-connect:
+        condition: service_healthy
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_GROUP_ID=debezium-postgres-replicator
-      - TOPIC_PATTERN=^cdc\.inventory\..*
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=inventory_sink
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres_password
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      KAFKA_GROUP_ID: "${CONSUMER_GROUP_ID:-isra-cdc-consumer-group}"
+      TOPIC_PATTERN: "${TOPIC_PATTERN:-^mongo_cdc\\.ISRA_new\\..*}"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: "${POSTGRES_DB:-isra_cdc}"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
     networks:
-      - cdc-network
+      - cdc-net
 
-  # =========================================================================
-  # 7. Kafka UI (Web Console for monitoring topics, messages & connectors)
-  # =========================================================================
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
-    restart: always
-    ports:
-      - "8080:8080"
-    depends_on:
-      - kafka
-      - connect
-    environment:
-      - KAFKA_CLUSTERS_0_NAME=debezium-cdc-cluster
-      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
-      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
-      - KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME=debezium-connect
-      - KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS=http://connect:8083
-    networks:
-      - cdc-network
+volumes:
+  mongo_data:
+    name: isra_mongo_data
+  kafka_data:
+    name: isra_kafka_data
+  postgres_data:
+    name: isra_postgres_data
+  pgadmin_data:
+    name: isra_pgadmin_data
+
+networks:
+  cdc-net:
+    name: isra_cdc_net
+    driver: bridge

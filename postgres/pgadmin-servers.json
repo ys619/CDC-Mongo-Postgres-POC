@@ -1,0 +1,18 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "ISRA CDC - PostgreSQL",
+      "Group": "CDC POC",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "isra_cdc",
+      "Username": "postgres",
+      "Password": "postgres",
+      "SSLMode": "prefer",
+      "ConnectionParameters": {
+        "sslmode": "prefer",
+        "connect_timeout": 10
+      }
+    }
+  }
+}

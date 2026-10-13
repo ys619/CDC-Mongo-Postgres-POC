@@ -1,298 +1,313 @@
-# Event-Driven CDC via Debezium & Apache Kafka: MongoDB to PostgreSQL Replication
+# Event-Driven CDC POC — MongoDB to PostgreSQL using Debezium and Kafka
 
-A production-grade Proof of Concept (POC) demonstrating **Change Data Capture (CDC)** using **Debezium** to capture transaction log (oplog) events from **MongoDB**, publish them as event streams to **Apache Kafka**, and replicate/upsert them in real-time into **PostgreSQL**.
-
----
-
-## 🏛️ Architecture Overview
+## Architecture Overview
 
 ```mermaid
 flowchart LR
-    subgraph Source["Source Database"]
-        MDB[("MongoDB\n(Replica Set rs0)")]
-        OPLOG["MongoDB Oplog\n(local.oplog.rs)"]
-        MDB --> OPLOG
+    subgraph Host ["Windows Host (Port 27017)"]
+        SrcMongo[("Existing MongoDB 8.0<br/>Database: ISRA / ISRA_new<br/>(Untouched & Preserved)")]
     end
 
-    subgraph Streaming["Streaming Platform"]
-        KC["Debezium Kafka Connect\n(MongoDbConnector)"]
-        ZK["Apache Zookeeper"]
-        KF["Apache Kafka Broker"]
-        KUI["Kafka UI\n(Port 8080)"]
-        
-        OPLOG -- "Change Streams / Oplog" --> KC
-        KC -- "Produces JSON Events" --> KF
-        ZK --- KF
-        KF --- KUI
+    subgraph Docker ["Docker Desktop Network (isra_cdc_net)"]
+        subgraph SourceGroup ["Isolated Source Instance"]
+            IsoMongo[("Isolated MongoDB 8.0<br/>Replica Set: rs0<br/>Port: 27018<br/>Volume: isra_mongo_data")]
+        end
+
+        subgraph EventBus ["Streaming Event Bus"]
+            Kafka["Apache Kafka 3.8.0<br/>KRaft Mode (No ZooKeeper)<br/>Port: 9092<br/>Volume: isra_kafka_data"]
+            Debezium["Kafka Connect 2.7.3<br/>Debezium Mongo Plugin<br/>Port: 8083"]
+            KafkaUI["Kafka UI<br/>Port: 8082 (configurable)"]
+        end
+
+        subgraph SinkGroup ["Target & Consumer"]
+            Consumer["Python CDC Consumer<br/>- Dynamic Regex Subscription<br/>- Idempotent Upsert<br/>- Tombstone-Safe Deletes<br/>- Transactional Commit"]
+            Postgres[("PostgreSQL 16<br/>Database: isra_cdc<br/>Table: mongo_documents<br/>Port: 5432<br/>Volume: isra_postgres_data")]
+        end
     end
 
-    subgraph Consumer["Replication Receiver"]
-        CDC_RCV["Python CDC Consumer\n(Subscribed to cdc.inventory.*)"]
-        KF -- "Topic: cdc.inventory.customers" --> CDC_RCV
-    end
-
-    subgraph Target["Target Database"]
-        PG[("PostgreSQL\n(inventory_sink)")]
-        CDC_RCV -- "Idempotent UPSERT / UPDATE / DELETE" --> PG
-    end
+    SrcMongo -.->|"Logical Clone (Read-Only)<br/>clone-source-data.ps1"| IsoMongo
+    IsoMongo -->|"Change Streams (Oplog)"| Debezium
+    Debezium -->|"CDC Topics: mongo_cdc.ISRA_new.*"| Kafka
+    Kafka -->|"Events (r, c, u, d)"| Consumer
+    Consumer -->|"Transactional Upsert / Delete"| Postgres
+    KafkaUI -.->|"Monitor Topics & Lag"| Kafka
 ```
 
 ---
 
-## 📦 Components Included
+## Prerequisites and Compatible Versions
 
-| Service | Container Name | Port | Description |
-| :--- | :--- | :--- | :--- |
-| **MongoDB** | `mongodb` | `27017` | Source database running with replica set `rs0` for Oplog change streams. |
-| **Mongo Initializer** | `mongo-init` | - | Automated startup job that executes `rs.initiate()` and ensures collections exist. |
-| **Zookeeper** | `zookeeper` | `2181` | Coordination service for Apache Kafka. |
-| **Kafka Broker** | `kafka` | `9092`, `29092` | Distributed streaming broker holding the CDC event topics. |
-| **Debezium Connect** | `connect` | `8083` | Kafka Connect runtime hosting Debezium MongoDB Source Connector. |
-| **PostgreSQL** | `postgres` | `5432` | Target relational database with pre-configured schemas and audit tables. |
-| **CDC Replicator** | `cdc-consumer` | - | Event receiver that consumes Kafka events and updates PostgreSQL in real time. |
-| **Kafka UI** | `kafka-ui` | `8080` | Web UI to inspect topics, live messages, connectors, and consumer lag. |
-
----
-
-## 🚀 Quick Start on Blank Ubuntu 22.04 Server
-
-### Step 1: Push from Local & Clone on Server
-
-On your local machine:
-```bash
-git init
-git add .
-git commit -m "feat: complete debezium mongodb to postgres cdc stack"
-git branch -M main
-git remote add origin https://github.com/ys619/<your-repo-name>.git
-git push -u origin main
-```
-
-On your **Ubuntu 22.04 server**:
-```bash
-git clone https://github.com/ys619/<your-repo-name>.git
-cd <your-repo-name>
-```
+| Component | Selected Version | Role | Compatibility Rationale |
+|---|---|---|---|
+| **Host OS** | Windows 10/11 + Docker Desktop | Host Environment | Standard container runtime |
+| **Existing Source MongoDB** | MongoDB 8.0 on Windows (Port 27017) | Production DB | Never touched, reconfigured, or mounted |
+| **Isolated Source MongoDB** | `mongo:8.0` (Replica set `rs0`, Port 27018) | CDC Source Instance | Change stream compatible, single-node replica set |
+| **Apache Kafka** | `apache/kafka:3.8.0` (Port 9092) | Event Streaming Broker | Native KRaft mode, eliminates ZooKeeper |
+| **Debezium Connect** | `debezium/connect:2.7.3.Final` (Port 8083) | Change Data Capture Engine | Official MongoDB connector plugin pre-installed |
+| **Kafka UI** | `provectuslabs/kafka-ui:latest` (Port 8082) | Observability UI | Real-time topic inspection, consumer lag monitoring |
+| **PostgreSQL Target** | `postgres:16-alpine` (Port 5432) | Target Database | Native JSONB storage and GIN indexing |
+| **Python Consumer** | Python 3.11 (`confluent-kafka`, `psycopg2`) | Standalone CDC Consumer | High-throughput, manual offset commit, graceful shutdown |
 
 ---
 
-### Step 2: One-Command Automated Setup
+## Project Directory Structure
 
-Run the automated setup script which installs Docker, starts all services, registers the Debezium connector, and executes the verification test:
-
-```bash
-chmod +x scripts/setup-server.sh
-./scripts/setup-server.sh
-```
-
----
-
-### Step 3: Manual Execution (Alternative)
-
-If you prefer running step-by-step:
-
-1. **Start all Docker containers:**
-   ```bash
-   docker compose up -d --build
-   ```
-
-2. **Verify containers are healthy:**
-   ```bash
-   docker compose ps
-   ```
-
-3. **Register the Debezium MongoDB Connector:**
-   ```bash
-   chmod +x scripts/register-connectors.sh
-   ./scripts/register-connectors.sh
-   ```
-   *(Or on Windows PowerShell: `.\scripts\register-connectors.ps1`)*
-
-4. **Run the End-to-End Verification Test:**
-   ```bash
-   chmod +x scripts/test-cdc.sh
-   ./scripts/test-cdc.sh
-   ```
-
----
-
-## 🧪 Live Demonstration Guide (For Managers & Stakeholders)
-
-### 1. Visual Inspection via Kafka UI
-Open your browser and navigate to:
-```
-http://<SERVER_PUBLIC_IP>:8080
-```
-- Navigate to **Topics**: Inspect `cdc.inventory.customers`.
-- Navigate to **Kafka Connect**: Verify `mongodb-source-connector` status is `RUNNING`.
-- View live messages as operations occur in MongoDB.
-
----
-
-### 2. Test Real-Time Replication Manually
-
-#### Step 2.1: Insert a Document in MongoDB
-```bash
-docker exec -it mongodb mongosh inventory --eval '
-  db.customers.insertOne({
-    _id: "cust_demo_01",
-    first_name: "Jane",
-    last_name: "Doe",
-    email: "jane.doe@example.com",
-    phone: "+1-555-0199",
-    address: { city: "London", country: "UK" },
-    status: "ACTIVE"
-  });
-'
-```
-
-#### Step 2.2: Verify Immediate Appearance in PostgreSQL
-```bash
-docker exec -it postgres psql -U postgres -d inventory_sink -c '
-  SELECT id, first_name, email, status, last_cdc_op, last_cdc_timestamp FROM customers WHERE id = '\''cust_demo_01'\'';
-'
-```
-*Result shows `last_cdc_op = 'c'` (Create).*
-
----
-
-#### Step 2.3: Update Document in MongoDB
-```bash
-docker exec -it mongodb mongosh inventory --eval '
-  db.customers.updateOne(
-    { _id: "cust_demo_01" },
-    { $set: { status: "PREMIUM", email: "jane.premium@example.com" } }
-  );
-'
-```
-
-#### Step 2.4: Verify Update in PostgreSQL
-```bash
-docker exec -it postgres psql -U postgres -d inventory_sink -c '
-  SELECT id, first_name, email, status, last_cdc_op, updated_at FROM customers WHERE id = '\''cust_demo_01'\'';
-'
-```
-*Result immediately shows status updated to `PREMIUM` with `last_cdc_op = 'u'`.*
-
----
-
-#### Step 2.5: Delete Document in MongoDB
-```bash
-docker exec -it mongodb mongosh inventory --eval '
-  db.customers.deleteOne({ _id: "cust_demo_01" });
-'
-```
-
-#### Step 2.6: Verify Deletion Handling in PostgreSQL
-```bash
-docker exec -it postgres psql -U postgres -d inventory_sink -c '
-  SELECT id, deleted, last_cdc_op FROM customers WHERE id = '\''cust_demo_01'\'';
-'
-```
-*Result shows `deleted = true` with `last_cdc_op = 'd'`.*
-
----
-
-#### Step 2.7: Check the CDC Audit Log
-```bash
-docker exec -it postgres psql -U postgres -d inventory_sink -c '
-  SELECT audit_id, source_collection, document_id, operation, cdc_timestamp, replicated_at
-  FROM cdc_audit_log
-  WHERE document_id = '\''cust_demo_01'\''
-  ORDER BY audit_id ASC;
-'
+```text
+C:\CDC-Mongo-Postgres-POC\
+├── docker-compose.yml              # Complete multi-container service stack & volumes
+├── .env.example                    # Template environment configuration
+├── .env                            # Active environment file (auto-generated)
+├── .gitignore                      # Git ignore rules
+├── README.md                       # Comprehensive POC guide & operations documentation
+├── start.ps1                       # Automated 1-click startup, replica set init, connector setup
+├── stop.ps1                        # Graceful container stop (preserves persistent volumes)
+├── verify.ps1                      # Diagnostic health check across all services
+├── mongodb\
+│   └── init-replica-set.js        # Script to initiate single-node replica set rs0
+├── debezium\
+│   └── register-connector.json    # Debezium MongoDB connector configuration definition
+├── consumer\
+│   ├── Dockerfile                  # Consumer container definition
+│   ├── requirements.txt            # Python dependencies (confluent-kafka, psycopg2-binary)
+│   ├── main.py                     # Resilient CDC consumer loop with transactional commits
+│   ├── config.py                   # Consumer environment variable configuration loader
+│   └── README.md                   # Dedicated consumer documentation
+├── postgres\
+│   └── init.sql                    # Initial target schema (mongo_documents table & indexes)
+├── scripts\
+│   ├── clone-source-data.ps1       # Safe logical clone with disk space verification
+│   ├── clone_helper.py             # Python BSON-preserving data transfer utility
+│   ├── register-connector.ps1      # Kafka Connect REST API registration & health polling
+│   ├── test-cdc.ps1                # Automated end-to-end verification script
+│   └── cdc_test_runner.py          # Python E2E test driver (inserts, updates, deletes)
+└── logs\                           # Persistent consumer logs directory
 ```
 
 ---
 
-## 🔍 How It Works Under the Hood
+## Setup and Startup Instructions
 
-1. **MongoDB Replica Set & Oplog**:
-   Debezium requires MongoDB to run as a replica set (`rs0`). All writes (`INSERT`, `UPDATE`, `DELETE`) are recorded in MongoDB's transaction log (`local.oplog.rs`).
+### 1. Initial Launch
+Open PowerShell and navigate to the project directory:
+```powershell
+cd C:\CDC-Mongo-Postgres-POC
+.\start.ps1
+```
 
-2. **Debezium MongoDB Connector**:
-   The connector connects to MongoDB using Change Streams. It tails the oplog and publishes structured change events to Apache Kafka under topic `cdc.inventory.<collection>`.
-   - `capture.mode = "change_streams_update_full"` ensures that updates contain the complete document state in the `after` field for easy replication.
+The script automatically executes the following:
+1. Validates Docker Desktop status (Linux container mode).
+2. Verifies or generates `.env` from `.env.example`.
+3. Launches all 6 Docker Compose services (`mongo-source`, `kafka`, `kafka-connect`, `kafka-ui`, `postgres`, `cdc-consumer`).
+4. Waits for health checks to report `Healthy`.
+5. Initiates MongoDB replica set `rs0` on port 27017 inside the container.
+6. Verifies the Debezium connector plugin and registers `isra-mongodb-connector`.
+7. Displays all active service URLs.
 
-3. **CDC Event Payload Structure**:
-   ```json
-   {
-     "op": "u",
-     "ts_ms": 1728470000000,
-     "source": { "db": "inventory", "collection": "customers" },
-     "after": "{\"_id\": \"cust_demo_01\", \"first_name\": \"Jane\", \"status\": \"PREMIUM\"}",
-     "filter": "{\"_id\": \"cust_demo_01\"}"
-   }
-   ```
-
-4. **Receiver / Replicator Service (`consumer/consumer.py`)**:
-   - Subscribes to `cdc.inventory.*` topics on Kafka.
-   - Extracts document fields dynamically.
-   - Executes idempotent SQL `INSERT ... ON CONFLICT (id) DO UPDATE SET ...` to PostgreSQL.
-   - Preserves complete raw documents in a PostgreSQL `JSONB` column (`raw_document`).
-   - Handles soft-deletes and maintains a transactional CDC audit table.
+### 2. Service Endpoints
+| Service | Endpoint | Purpose |
+|---|---|---|
+| **Kafka UI** | `http://localhost:8082` | Topic inspection, message payloads, consumer group lag |
+| **Kafka Connect REST API** | `http://localhost:8083` | Connector lifecycle management and status queries |
+| **Kafka Broker** | `localhost:9092` | External Kafka listener for host tools |
+| **Isolated MongoDB** | `localhost:27018` | Replica set `rs0` (`?directConnection=true` from host) |
+| **Target PostgreSQL** | `localhost:5432` | Database `isra_cdc`, Table `mongo_documents` |
 
 ---
 
-## 🛠️ Management & Monitoring Commands
+## Source-Data Cloning & Storage Safeguards
 
-### View Live Replication Consumer Logs
-```bash
+### Safety Principles
+- **No Direct Mounts**: The existing MongoDB data directory (`C:\Program Files\MongoDB\Server\8.0\data`) is **NEVER** mounted into Docker.
+- **Read-Only Inspection**: Source database `localhost:27017` is read using standard query cursors and is never modified.
+- **Disk Space Verification**: The script checks free storage on Drive `C:` before performing any clone.
+- **BSON Type Preservation**: BSON types (`ObjectId`, `ISODate`, `Binary`, embedded dicts) are preserved without truncation.
+
+### Cloning Commands
+
+```powershell
+# 1. Interactive inspection and prompt before clone (default):
+.\scripts\clone-source-data.ps1 -SourceDb ISRA -TargetDb ISRA_new
+
+# 2. Fast POC sampling (clones up to 10 documents per collection):
+.\scripts\clone-source-data.ps1 -SourceDb ISRA -TargetDb ISRA_new -SampleLimit 10 -Force
+
+# 3. Specific business collections:
+.\scripts\clone-source-data.ps1 -SourceDb ISRA -TargetDb ISRA_new -Collections "Radio_masterradioproject,Radio_priority" -SampleLimit 50 -Force
+```
+
+---
+
+## Debezium Connector Configuration & Inspection
+
+### Registration
+The connector configuration resides in `debezium/register-connector.json`.
+To register or update:
+```powershell
+.\scripts\register-connector.ps1 -Force
+```
+
+### Connector Details
+- **Connector Name**: `isra-mongodb-connector`
+- **Topic Prefix**: `mongo_cdc`
+- **Database Include**: `ISRA_new`
+- **Capture Mode**: `change_streams_update_full` (ensures full document is present in update events)
+- **Snapshot Mode**: `initial` (captures all existing records, then transitions seamlessly to live change streams)
+
+### Check Status via REST API
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8083/connectors/isra-mongodb-connector/status" | ConvertTo-Json -Depth 4
+```
+
+Expected Response:
+```json
+{
+  "name": "isra-mongodb-connector",
+  "connector": {
+    "state": "RUNNING",
+    "worker_id": "172.19.0.5:8083"
+  },
+  "tasks": [
+    {
+      "id": 0,
+      "state": "RUNNING",
+      "worker_id": "172.19.0.5:8083"
+    }
+  ],
+  "type": "source"
+}
+```
+
+---
+
+## Kafka Topics and Message Inspection
+
+### Topic Naming Convention
+Debezium publishes events following this convention:
+`mongo_cdc.ISRA_new.<collection_name>`
+
+### Web UI
+Navigate to [http://localhost:8082](http://localhost:8082):
+1. Go to **Topics** -> Click on any `mongo_cdc.ISRA_new.*` topic.
+2. Go to **Messages** to view BSON Extended JSON payloads.
+3. Go to **Consumers** to monitor consumer lag on `isra-cdc-consumer-group`.
+
+---
+
+## PostgreSQL Target Schema & Queries
+
+Target Database: `isra_cdc`
+
+```sql
+CREATE TABLE IF NOT EXISTS mongo_documents (
+    source_database TEXT NOT NULL,
+    collection_name TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    document JSONB,
+    last_operation TEXT,
+    source_timestamp TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (source_database, collection_name, document_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mongo_documents_lookup ON mongo_documents(source_database, collection_name);
+CREATE INDEX IF NOT EXISTS idx_mongo_documents_updated ON mongo_documents(updated_at);
+CREATE INDEX IF NOT EXISTS idx_mongo_documents_gin ON mongo_documents USING GIN (document);
+```
+
+### Querying PostgreSQL
+```powershell
+docker exec -it isra-postgres psql -U postgres -d isra_cdc
+```
+
+Sample SQL queries:
+```sql
+-- 1. Check synchronized collections and document counts
+SELECT source_database, collection_name, COUNT(*), MAX(updated_at)
+FROM mongo_documents
+GROUP BY source_database, collection_name;
+
+-- 2. Query fields from JSONB documents
+SELECT document_id, document->>'Project_Name' as project, last_operation, updated_at
+FROM mongo_documents
+WHERE collection_name = 'Radio_masterradioproject';
+
+-- 3. Query documents using JSONB containment
+SELECT document_id, document
+FROM mongo_documents
+WHERE document @> '{"Demo": "Final"}';
+```
+
+---
+
+## End-to-End Automated Verification Test
+
+Run the complete pipeline verification:
+```powershell
+.\scripts\test-cdc.ps1
+```
+
+### What the Test Verifies:
+1. **Insert**: Creates a document in MongoDB `ISRA_new.cdc_test_pipeline` -> Verifies Debezium captures the event (`op: c`) -> Verifies Python consumer writes the record to PostgreSQL `mongo_documents`.
+2. **Update**: Modifies the document in MongoDB (`version: 2`, `status: UPDATED_STATE_VERIFIED`) -> Verifies Debezium captures update (`op: u`) -> Verifies PostgreSQL row is updated.
+3. **Delete**: Deletes the document in MongoDB -> Verifies Debezium captures delete (`op: d`) -> Verifies the document row is cleanly deleted from PostgreSQL.
+
+Both snapshot reads (`op: r`) and live change events (`op: c, u, d`) are supported.
+
+---
+
+## Troubleshooting Guide
+
+### 1. Port 8080 Conflict
+If port 8080 is used by Windows services (`blservice`, IIS, etc.), Kafka UI is configured on port `8082` in `.env` (`KAFKA_UI_HOST_PORT=8082`). To change the port, update `KAFKA_UI_HOST_PORT` in `.env`.
+
+### 2. Host MongoDB Driver Connection to Isolated MongoDB
+When connecting from host Python or tools to `localhost:27018`:
+Always include `?directConnection=true`:
+```python
+client = pymongo.MongoClient("mongodb://localhost:27018/?directConnection=true")
+```
+This prevents driver replica set topology discovery from attempting to resolve the container internal hostname `mongo-source:27017`.
+
+### 3. Debezium Connector Unassigned or Failed
+Check Kafka Connect logs:
+```powershell
+docker compose logs kafka-connect --tail 50
+```
+To restart or re-register the connector:
+```powershell
+.\scripts\register-connector.ps1 -Force
+```
+
+### 4. Consumer Log Inspection
+```powershell
 docker compose logs -f cdc-consumer
 ```
-
-### View Debezium Kafka Connect Logs
-```bash
-docker compose logs -f connect
-```
-
-### Check Connector Status via REST API
-```bash
-curl -s http://localhost:8083/connectors/mongodb-source-connector/status | jq .
-```
-
-### Restart Connector
-```bash
-curl -s -X POST http://localhost:8083/connectors/mongodb-source-connector/restart
-```
-
-### Stop All Containers
-```bash
-docker compose down
-```
-
-### Tear Down Everything (Including Volumes)
-```bash
-docker compose down -v
-```
+Persistent logs are written to `logs/consumer.log`.
 
 ---
 
-## 📂 Repository Structure
+## Stopping and Restarting Without Data Loss
 
+### Stop POC
+```powershell
+.\stop.ps1
 ```
-.
-├── docker-compose.yml              # Complete 7-container Docker Compose stack
-├── .env.example                    # Environment variable template
-├── .gitignore                      # Git ignore rules
-├── README.md                       # Comprehensive guide and documentation
-├── configs/
-│   ├── mongodb-source-connector.json  # Debezium MongoDB Source Connector definition
-│   └── postgres-sink-connector.json   # Optional Kafka Connect JDBC Sink configuration
-├── mongo/
-│   └── init/
-│       └── 01-init-replica.js      # MongoDB replica set initialisation script
-├── postgres/
-│   └── init/
-│       └── 01-init.sql             # PostgreSQL target table and audit log schema
-├── consumer/
-│   ├── Dockerfile                  # Container for Python CDC replication receiver
-│   ├── requirements.txt            # Python dependencies (kafka-python-ng, psycopg2)
-│   └── consumer.py                 # CDC Consumer and PostgreSQL replicator logic
-└── scripts/
-    ├── setup-server.sh             # 1-click installation & startup for Ubuntu 22.04
-    ├── register-connectors.sh      # Shell script to register connector via REST API
-    ├── register-connectors.ps1     # Windows PowerShell registration script
-    ├── test-cdc.sh                 # Zero-dependency bash test script
-    └── verify-replication.py       # Python automated test suite
+This runs `docker compose down` without `-v`. Named Docker volumes (`isra_mongo_data`, `isra_kafka_data`, `isra_postgres_data`) are preserved.
+
+### Resume POC
+```powershell
+.\start.ps1
 ```
+All data and connector offset bookmarks are preserved, and processing resumes from where it stopped.
+
+---
+
+## Known Limitations & Production Readiness Next Steps
+
+1. **Dead Letter Queue (DLQ)**: For production pipelines, configure Kafka DLQ topics to capture unparseable messages without stalling the consumer partition.
+2. **PostgreSQL Target Tables**: The POC preserves arbitrary BSON documents as `JSONB` in a single table `mongo_documents`. In production, collections can either be mapped into dedicated typed tables or extracted via dbt/PostgreSQL views.
+3. **High Availability**:
+   - Multi-broker Kafka cluster with `replication.factor >= 3`.
+   - Multi-node MongoDB replica set across independent availability zones.
+   - Distributed Kafka Connect cluster with multiple workers.
+4. **Consumer Scaling**: Increase partition count on Kafka topics to allow multiple parallel Python consumer instances in consumer group `isra-cdc-consumer-group`.

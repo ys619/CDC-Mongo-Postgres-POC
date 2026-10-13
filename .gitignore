@@ -1,25 +1,25 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-env/
-venv/
-.venv/
-ENV/
-
-# Docker volumes / persistence
-mongo_data/
-postgres_data/
-
-# Environment files
+# Environment & Secrets
 .env
 
-# Logs & temp
+# Logs
+logs/*.log
 *.log
-.system_generated/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Database dumps / temp files
+dump/
+*.dump
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
